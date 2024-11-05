@@ -1,9 +1,11 @@
 import copy
 import os
+import re
 import statistics
 import time
 from typing import List
 
+import numpy
 import torch
 from loguru import logger
 
@@ -19,36 +21,46 @@ from magic_pdf.libs.hash_utils import compute_md5
 from magic_pdf.libs.local_math import float_equal
 from magic_pdf.libs.ocr_content_type import ContentType, BlockType
 from magic_pdf.model.magic_model import MagicModel
+from magic_pdf.model.model_list import AtomicModel
+from magic_pdf.model.pdf_extract_kit import AtomModelSingleton
 from magic_pdf.para.para_split_v3 import para_split
 from magic_pdf.pre_proc.citationmarker_remove import remove_citation_marker
-from magic_pdf.pre_proc.construct_page_dict import \
-    ocr_construct_page_component_v2
+from magic_pdf.pre_proc.construct_page_dict import ocr_construct_page_component_v2
 from magic_pdf.pre_proc.cut_image import ocr_cut_image_and_table
 from magic_pdf.pre_proc.equations_replace import (
-    combine_chars_to_pymudict, remove_chars_in_text_blocks,
-    replace_equations_in_textblock)
-from magic_pdf.pre_proc.ocr_detect_all_bboxes import \
-    ocr_prepare_bboxes_for_layout_split_v2
-from magic_pdf.pre_proc.ocr_dict_merge import (fill_spans_in_blocks,
-                                               fix_block_spans,
-                                               fix_discarded_block, fix_block_spans_v2)
+    combine_chars_to_pymudict,
+    remove_chars_in_text_blocks,
+    replace_equations_in_textblock,
+)
+from magic_pdf.pre_proc.ocr_detect_all_bboxes import (
+    ocr_prepare_bboxes_for_layout_split_v2,
+)
+from magic_pdf.pre_proc.ocr_dict_merge import (
+    fill_spans_in_blocks,
+    fix_block_spans,
+    fix_discarded_block,
+    fix_block_spans_v2,
+)
 from magic_pdf.pre_proc.ocr_span_list_modify import (
-    get_qa_need_list_v2, remove_overlaps_low_confidence_spans,
-    remove_overlaps_min_spans)
-from magic_pdf.pre_proc.resolve_bbox_conflict import \
-    check_useful_block_horizontal_overlap
+    get_qa_need_list_v2,
+    remove_overlaps_low_confidence_spans,
+    remove_overlaps_min_spans,
+)
+from magic_pdf.pre_proc.resolve_bbox_conflict import (
+    check_useful_block_horizontal_overlap,
+)
 
 
 def remove_horizontal_overlap_block_which_smaller(all_bboxes):
     useful_blocks = []
     for bbox in all_bboxes:
-        useful_blocks.append({'bbox': bbox[:4]})
+        useful_blocks.append({"bbox": bbox[:4]})
     is_useful_block_horz_overlap, smaller_bbox, bigger_bbox = (
         check_useful_block_horizontal_overlap(useful_blocks)
     )
     if is_useful_block_horz_overlap:
         logger.warning(
-            f'skip this page, reason: {DropReason.USEFUL_BLOCK_HOR_OVERLAP}, smaller bbox is {smaller_bbox}, bigger bbox is {bigger_bbox}'
+            f"skip this page, reason: {DropReason.USEFUL_BLOCK_HOR_OVERLAP}, smaller bbox is {smaller_bbox}, bigger bbox is {bigger_bbox}"
         )  # noqa: E501
         for bbox in all_bboxes.copy():
             if smaller_bbox == bbox[:4]:
@@ -68,16 +80,44 @@ def __replace_STX_ETX(text_str: str):
             _type_: replaced text
     """  # noqa: E501
     if text_str:
-        s = text_str.replace('\u0002', "'")
-        s = s.replace('\u0003', "'")
+        s = text_str.replace("\u0002", "'")
+        s = s.replace("\u0003", "'")
         return s
     return text_str
 
 
-def txt_spans_extract(pdf_page, inline_equations, interline_equations):
-    text_raw_blocks = pdf_page.get_text('dict', flags=fitz.TEXTFLAGS_TEXT)['blocks']
-    char_level_text_blocks = pdf_page.get_text('rawdict', flags=fitz.TEXTFLAGS_TEXT)[
-        'blocks'
+def is_corrupted_text(text: str) -> bool:
+    """
+    Check if text contains corrupted Unicode sequences
+    """
+    # Check for various escape sequences that indicate corrupted text
+    patterns = [
+        r"\\u[0-9a-fA-F]{4}",  # \uXXXX
+        r"\\U[0-9a-fA-F]{8}",  # \UXXXXXXXX
+        r"\\x[0-9a-fA-F]+",  # \xXXXX
+        r"[\uFFFD]",  # Unicode replacement character
+    ]
+
+    for pattern in patterns:
+        if re.search(pattern, repr(text)):
+            return True
+    return False
+
+
+def get_span_bbox_for_ocr(span):
+    """
+    Convert span bbox to the format expected by OCR
+    """
+    bbox = span["bbox"]
+    # Add some padding around the bbox to ensure complete text capture
+    padding = 2
+    return [bbox[0] - padding, bbox[1] - padding, bbox[2] + padding, bbox[3] + padding]
+
+
+def txt_spans_extract(pdf_page, inline_equations, interline_equations, ocr_model=None):
+    text_raw_blocks = pdf_page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)["blocks"]
+    char_level_text_blocks = pdf_page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)[
+        "blocks"
     ]
     text_blocks = combine_chars_to_pymudict(text_raw_blocks, char_level_text_blocks)
     text_blocks = replace_equations_in_textblock(
@@ -86,45 +126,111 @@ def txt_spans_extract(pdf_page, inline_equations, interline_equations):
     text_blocks = remove_citation_marker(text_blocks)
     text_blocks = remove_chars_in_text_blocks(text_blocks)
     spans = []
+    corrupted_spans = []
     for v in text_blocks:
-        for line in v['lines']:
-            for span in line['spans']:
-                bbox = span['bbox']
+        for line in v["lines"]:
+            for span in line["spans"]:
+                bbox = span["bbox"]
                 if float_equal(bbox[0], bbox[2]) or float_equal(bbox[1], bbox[3]):
                     continue
-                if span.get('type') not in (
+                if span.get("type") not in (
                     ContentType.InlineEquation,
                     ContentType.InterlineEquation,
                 ):
+                    text = __replace_STX_ETX(span["text"])
+                    if is_corrupted_text(text):
+                        corrupted_spans.append(
+                            {
+                                "bbox": get_span_bbox_for_ocr(span),
+                                "original_span": span,
+                            }
+                        )
+                    else:
+                        spans.append(
+                            {
+                                "bbox": list(span["bbox"]),
+                                "content": text,
+                                "type": ContentType.Text,
+                                "score": 1.0,
+                            }
+                        )
+    if ocr_model and corrupted_spans:
+        # Create page image
+        pix = pdf_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale for better OCR
+        img = numpy.frombuffer(pix.samples, dtype=numpy.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )
+
+        # Process each corrupted span
+        for corrupted_span in corrupted_spans:
+            bbox = corrupted_span["bbox"]
+            # Scale bbox coordinates to match the pixmap
+            scaled_bbox = [coord * 2 for coord in bbox]
+
+            # Extract region and run OCR
+            try:
+                ocr_result = ocr_model.ocr(
+                    img[
+                        int(scaled_bbox[1]) : int(scaled_bbox[3]),
+                        int(scaled_bbox[0]) : int(scaled_bbox[2]),
+                    ]
+                )
+
+                if ocr_result and ocr_result[0]:
+                    # Use the OCR result
                     spans.append(
                         {
-                            'bbox': list(span['bbox']),
-                            'content': __replace_STX_ETX(span['text']),
-                            'type': ContentType.Text,
-                            'score': 1.0,
+                            "bbox": corrupted_span["original_span"]["bbox"],
+                            "content": ocr_result[0][0][1][
+                                0
+                            ],  # Get text from OCR result
+                            "type": ContentType.Text,
+                            "score": ocr_result[0][0][1][1],  # Get confidence score
                         }
                     )
+                else:
+                    # Fallback to original corrupted text if OCR fails
+                    spans.append(
+                        {
+                            "bbox": corrupted_span["original_span"]["bbox"],
+                            "content": corrupted_span["original_span"]["text"],
+                            "type": ContentType.Text,
+                            "score": 0.5,
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"OCR failed for span: {e}")
+                # Fallback to original corrupted text
+                spans.append(
+                    {
+                        "bbox": corrupted_span["original_span"]["bbox"],
+                        "content": corrupted_span["original_span"]["text"],
+                        "type": ContentType.Text,
+                        "score": 0.5,
+                    }
+                )
+
     return spans
 
 
 def replace_text_span(pymu_spans, ocr_spans):
-    return list(filter(lambda x: x['type'] != ContentType.Text, ocr_spans)) + pymu_spans
+    return list(filter(lambda x: x["type"] != ContentType.Text, ocr_spans)) + pymu_spans
 
 
 def model_init(model_name: str):
     from transformers import LayoutLMv3ForTokenClassification
 
     if torch.cuda.is_available():
-        device = torch.device('cuda')
+        device = torch.device("cuda")
         if torch.cuda.is_bf16_supported():
             supports_bfloat16 = True
         else:
             supports_bfloat16 = False
     else:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
         supports_bfloat16 = False
 
-    if model_name == 'layoutreader':
+    if model_name == "layoutreader":
         # 检测modelscope的缓存目录是否存在
         layoutreader_model_dir = get_local_layoutreader_model_dir()
         if os.path.exists(layoutreader_model_dir):
@@ -133,17 +239,17 @@ def model_init(model_name: str):
             )
         else:
             logger.warning(
-                'local layoutreader model not exists, use online model from huggingface'
+                "local layoutreader model not exists, use online model from huggingface"
             )
             model = LayoutLMv3ForTokenClassification.from_pretrained(
-                'hantian/layoutreader'
+                "hantian/layoutreader"
             )
         # 检查设备是否支持 bfloat16
         if supports_bfloat16:
             model.bfloat16()
         model.to(device).eval()
     else:
-        logger.error('model name not allow')
+        logger.error("model name not allow")
         exit(1)
     return model
 
@@ -164,8 +270,7 @@ class ModelSingleton:
 
 
 def do_predict(boxes: List[List[int]], model) -> List[int]:
-    from magic_pdf.model.v3.helpers import (boxes2inputs, parse_logits,
-                                            prepare_inputs)
+    from magic_pdf.model.v3.helpers import boxes2inputs, parse_logits, prepare_inputs
 
     inputs = boxes2inputs(boxes)
     inputs = prepare_inputs(inputs, model)
@@ -177,20 +282,20 @@ def cal_block_index(fix_blocks, sorted_bboxes):
     for block in fix_blocks:
 
         line_index_list = []
-        if len(block['lines']) == 0:
-            block['index'] = sorted_bboxes.index(block['bbox'])
+        if len(block["lines"]) == 0:
+            block["index"] = sorted_bboxes.index(block["bbox"])
         else:
-            for line in block['lines']:
-                line['index'] = sorted_bboxes.index(line['bbox'])
-                line_index_list.append(line['index'])
+            for line in block["lines"]:
+                line["index"] = sorted_bboxes.index(line["bbox"])
+                line_index_list.append(line["index"])
             median_value = statistics.median(line_index_list)
-            block['index'] = median_value
+            block["index"] = median_value
 
         # 删除图表body block中的虚拟line信息, 并用real_lines信息回填
-        if block['type'] in [BlockType.ImageBody, BlockType.TableBody]:
-            block['virtual_lines'] = copy.deepcopy(block['lines'])
-            block['lines'] = copy.deepcopy(block['real_lines'])
-            del block['real_lines']
+        if block["type"] in [BlockType.ImageBody, BlockType.TableBody]:
+            block["virtual_lines"] = copy.deepcopy(block["lines"])
+            block["lines"] = copy.deepcopy(block["real_lines"])
+            del block["real_lines"]
 
     return fix_blocks
 
@@ -240,28 +345,32 @@ def insert_lines_into_block(block_bbox, line_height, page_w, page_h):
 def sort_lines_by_model(fix_blocks, page_w, page_h, line_height):
     page_line_list = []
     for block in fix_blocks:
-        if block['type'] in [
-            BlockType.Text, BlockType.Title, BlockType.InterlineEquation,
-            BlockType.ImageCaption, BlockType.ImageFootnote,
-            BlockType.TableCaption, BlockType.TableFootnote
+        if block["type"] in [
+            BlockType.Text,
+            BlockType.Title,
+            BlockType.InterlineEquation,
+            BlockType.ImageCaption,
+            BlockType.ImageFootnote,
+            BlockType.TableCaption,
+            BlockType.TableFootnote,
         ]:
-            if len(block['lines']) == 0:
-                bbox = block['bbox']
+            if len(block["lines"]) == 0:
+                bbox = block["bbox"]
                 lines = insert_lines_into_block(bbox, line_height, page_w, page_h)
                 for line in lines:
-                    block['lines'].append({'bbox': line, 'spans': []})
+                    block["lines"].append({"bbox": line, "spans": []})
                 page_line_list.extend(lines)
             else:
-                for line in block['lines']:
-                    bbox = line['bbox']
+                for line in block["lines"]:
+                    bbox = line["bbox"]
                     page_line_list.append(bbox)
-        elif block['type'] in [BlockType.ImageBody, BlockType.TableBody]:
-            bbox = block['bbox']
-            block["real_lines"] = copy.deepcopy(block['lines'])
+        elif block["type"] in [BlockType.ImageBody, BlockType.TableBody]:
+            bbox = block["bbox"]
+            block["real_lines"] = copy.deepcopy(block["lines"])
             lines = insert_lines_into_block(bbox, line_height, page_w, page_h)
-            block['lines'] = []
+            block["lines"] = []
             for line in lines:
-                block['lines'].append({'bbox': line, 'spans': []})
+                block["lines"].append({"bbox": line, "spans": []})
             page_line_list.extend(lines)
 
     # 使用layoutreader排序
@@ -272,22 +381,22 @@ def sort_lines_by_model(fix_blocks, page_w, page_h, line_height):
     for left, top, right, bottom in page_line_list:
         if left < 0:
             logger.warning(
-                f'left < 0, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}'
+                f"left < 0, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}"
             )  # noqa: E501
             left = 0
         if right > page_w:
             logger.warning(
-                f'right > page_w, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}'
+                f"right > page_w, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}"
             )  # noqa: E501
             right = page_w
         if top < 0:
             logger.warning(
-                f'top < 0, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}'
+                f"top < 0, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}"
             )  # noqa: E501
             top = 0
         if bottom > page_h:
             logger.warning(
-                f'bottom > page_h, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}'
+                f"bottom > page_h, left: {left}, right: {right}, top: {top}, bottom: {bottom}, page_w: {page_w}, page_h: {page_h}"
             )  # noqa: E501
             bottom = page_h
 
@@ -297,10 +406,10 @@ def sort_lines_by_model(fix_blocks, page_w, page_h, line_height):
         bottom = round(bottom * y_scale)
         assert (
             1000 >= right >= left >= 0 and 1000 >= bottom >= top >= 0
-        ), f'Invalid box. right: {right}, left: {left}, bottom: {bottom}, top: {top}'  # noqa: E126, E121
+        ), f"Invalid box. right: {right}, left: {left}, bottom: {bottom}, top: {top}"  # noqa: E126, E121
         boxes.append([left, top, right, bottom])
     model_manager = ModelSingleton()
-    model = model_manager.get_model('layoutreader')
+    model = model_manager.get_model("layoutreader")
     with torch.no_grad():
         orders = do_predict(boxes, model)
     sorted_bboxes = [page_line_list[i] for i in orders]
@@ -311,13 +420,16 @@ def sort_lines_by_model(fix_blocks, page_w, page_h, line_height):
 def get_line_height(blocks):
     page_line_height_list = []
     for block in blocks:
-        if block['type'] in [
-            BlockType.Text, BlockType.Title,
-            BlockType.ImageCaption, BlockType.ImageFootnote,
-            BlockType.TableCaption, BlockType.TableFootnote
+        if block["type"] in [
+            BlockType.Text,
+            BlockType.Title,
+            BlockType.ImageCaption,
+            BlockType.ImageFootnote,
+            BlockType.TableCaption,
+            BlockType.TableFootnote,
         ]:
-            for line in block['lines']:
-                bbox = line['bbox']
+            for line in block["lines"]:
+                bbox = line["bbox"]
                 page_line_height_list.append(int(bbox[3] - bbox[1]))
     if len(page_line_height_list) > 0:
         return statistics.median(page_line_height_list)
@@ -330,28 +442,30 @@ def process_groups(groups, body_key, caption_key, footnote_key):
     caption_blocks = []
     footnote_blocks = []
     for i, group in enumerate(groups):
-        group[body_key]['group_id'] = i
+        group[body_key]["group_id"] = i
         body_blocks.append(group[body_key])
         for caption_block in group[caption_key]:
-            caption_block['group_id'] = i
+            caption_block["group_id"] = i
             caption_blocks.append(caption_block)
         for footnote_block in group[footnote_key]:
-            footnote_block['group_id'] = i
+            footnote_block["group_id"] = i
             footnote_blocks.append(footnote_block)
     return body_blocks, caption_blocks, footnote_blocks
 
 
 def process_block_list(blocks, body_type, block_type):
-    indices = [block['index'] for block in blocks]
+    indices = [block["index"] for block in blocks]
     median_index = statistics.median(indices)
 
-    body_bbox = next((block['bbox'] for block in blocks if block.get('type') == body_type), [])
+    body_bbox = next(
+        (block["bbox"] for block in blocks if block.get("type") == body_type), []
+    )
 
     return {
-        'type': block_type,
-        'bbox': body_bbox,
-        'blocks': blocks,
-        'index': median_index,
+        "type": block_type,
+        "bbox": body_bbox,
+        "blocks": blocks,
+        "index": median_index,
     }
 
 
@@ -360,13 +474,21 @@ def revert_group_blocks(blocks):
     table_groups = {}
     new_blocks = []
     for block in blocks:
-        if block['type'] in [BlockType.ImageBody, BlockType.ImageCaption, BlockType.ImageFootnote]:
-            group_id = block['group_id']
+        if block["type"] in [
+            BlockType.ImageBody,
+            BlockType.ImageCaption,
+            BlockType.ImageFootnote,
+        ]:
+            group_id = block["group_id"]
             if group_id not in image_groups:
                 image_groups[group_id] = []
             image_groups[group_id].append(block)
-        elif block['type'] in [BlockType.TableBody, BlockType.TableCaption, BlockType.TableFootnote]:
-            group_id = block['group_id']
+        elif block["type"] in [
+            BlockType.TableBody,
+            BlockType.TableCaption,
+            BlockType.TableFootnote,
+        ]:
+            group_id = block["group_id"]
             if group_id not in table_groups:
                 table_groups[group_id] = []
             table_groups[group_id].append(block)
@@ -374,10 +496,14 @@ def revert_group_blocks(blocks):
             new_blocks.append(block)
 
     for group_id, blocks in image_groups.items():
-        new_blocks.append(process_block_list(blocks, BlockType.ImageBody, BlockType.Image))
+        new_blocks.append(
+            process_block_list(blocks, BlockType.ImageBody, BlockType.Image)
+        )
 
     for group_id, blocks in table_groups.items():
-        new_blocks.append(process_block_list(blocks, BlockType.TableBody, BlockType.Table))
+        new_blocks.append(
+            process_block_list(blocks, BlockType.TableBody, BlockType.Table)
+        )
 
     return new_blocks
 
@@ -395,30 +521,40 @@ def remove_outside_spans(spans, all_bboxes, all_discarded_blocks):
         if block_type not in [BlockType.ImageBody, BlockType.TableBody]:
             other_block_type.append(block_type)
     other_block_bboxes = get_block_bboxes(all_bboxes, other_block_type)
-    discarded_block_bboxes = get_block_bboxes(all_discarded_blocks, [BlockType.Discarded])
+    discarded_block_bboxes = get_block_bboxes(
+        all_discarded_blocks, [BlockType.Discarded]
+    )
 
     new_spans = []
 
     for span in spans:
-        span_bbox = span['bbox']
-        span_type = span['type']
+        span_bbox = span["bbox"]
+        span_type = span["type"]
 
-        if any(calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.4 for block_bbox in
-               discarded_block_bboxes):
+        if any(
+            calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.4
+            for block_bbox in discarded_block_bboxes
+        ):
             new_spans.append(span)
             continue
 
         if span_type == ContentType.Image:
-            if any(calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.5 for block_bbox in
-                   image_bboxes):
+            if any(
+                calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.5
+                for block_bbox in image_bboxes
+            ):
                 new_spans.append(span)
         elif span_type == ContentType.Table:
-            if any(calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.5 for block_bbox in
-                   table_bboxes):
+            if any(
+                calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.5
+                for block_bbox in table_bboxes
+            ):
                 new_spans.append(span)
         else:
-            if any(calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.5 for block_bbox in
-                   other_block_bboxes):
+            if any(
+                calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox) > 0.5
+                for block_bbox in other_block_bboxes
+            ):
                 new_spans.append(span)
 
     return new_spans
@@ -438,11 +574,11 @@ def parse_page_core(
     table_groups = magic_model.get_tables_v2(page_id)
 
     img_body_blocks, img_caption_blocks, img_footnote_blocks = process_groups(
-        img_groups, 'image_body', 'image_caption_list', 'image_footnote_list'
+        img_groups, "image_body", "image_caption_list", "image_footnote_list"
     )
 
     table_body_blocks, table_caption_blocks, table_footnote_blocks = process_groups(
-        table_groups, 'table_body', 'table_caption_list', 'table_footnote_list'
+        table_groups, "table_body", "table_caption_list", "table_footnote_list"
     )
 
     discarded_blocks = magic_model.get_discarded(page_id)
@@ -459,8 +595,12 @@ def parse_page_core(
     interline_equation_blocks = []
     if len(interline_equation_blocks) > 0:
         all_bboxes, all_discarded_blocks = ocr_prepare_bboxes_for_layout_split_v2(
-            img_body_blocks, img_caption_blocks, img_footnote_blocks,
-            table_body_blocks, table_caption_blocks, table_footnote_blocks,
+            img_body_blocks,
+            img_caption_blocks,
+            img_footnote_blocks,
+            table_body_blocks,
+            table_caption_blocks,
+            table_footnote_blocks,
             discarded_blocks,
             text_blocks,
             title_blocks,
@@ -470,8 +610,12 @@ def parse_page_core(
         )
     else:
         all_bboxes, all_discarded_blocks = ocr_prepare_bboxes_for_layout_split_v2(
-            img_body_blocks, img_caption_blocks, img_footnote_blocks,
-            table_body_blocks, table_caption_blocks, table_footnote_blocks,
+            img_body_blocks,
+            img_caption_blocks,
+            img_footnote_blocks,
+            table_body_blocks,
+            table_caption_blocks,
+            table_footnote_blocks,
             discarded_blocks,
             text_blocks,
             title_blocks,
@@ -485,12 +629,18 @@ def parse_page_core(
     """根据parse_mode，构造spans"""
     if parse_mode == SupportedPdfParseMethod.TXT:
         """ocr 中文本类的 span 用 pymu spans 替换！"""
-        pymu_spans = txt_spans_extract(page_doc, inline_equations, interline_equations)
+        atom_model_manager = AtomModelSingleton()
+        ocr_model = atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.OCR, ocr_show_log=False, det_db_box_thresh=0.3
+        )
+        pymu_spans = txt_spans_extract(
+            page_doc, inline_equations, interline_equations, ocr_model=ocr_model
+        )
         spans = replace_text_span(pymu_spans, spans)
     elif parse_mode == SupportedPdfParseMethod.OCR:
         pass
     else:
-        raise Exception('parse_mode must be txt or ocr')
+        raise Exception("parse_mode must be txt or ocr")
 
     """在删除重复span之前，应该通过image_body和table_body的block过滤一下image和table的span"""
     """顺便删除大水印并保留abandon的span"""
@@ -513,7 +663,7 @@ def parse_page_core(
 
     """如果当前页面没有bbox则跳过"""
     if len(all_bboxes) == 0:
-        logger.warning(f'skip this page, not found useful bbox, page_id: {page_id}')
+        logger.warning(f"skip this page, not found useful bbox, page_id: {page_id}")
         return ocr_construct_page_component_v2(
             [],
             [],
@@ -548,7 +698,7 @@ def parse_page_core(
     fix_blocks = revert_group_blocks(fix_blocks)
 
     """重排block"""
-    sorted_blocks = sorted(fix_blocks, key=lambda b: b['index'])
+    sorted_blocks = sorted(fix_blocks, key=lambda b: b["index"])
 
     """获取QA需要外置的list"""
     images, tables, interline_equations = get_qa_need_list_v2(sorted_blocks)
@@ -597,7 +747,7 @@ def pdf_parse_union(
     )
 
     if end_page_id > len(dataset) - 1:
-        logger.warning('end_page_id is out of range, use pdf_docs length')
+        logger.warning("end_page_id is out of range, use pdf_docs length")
         end_page_id = len(dataset) - 1
 
     """初始化启动时间"""
@@ -608,7 +758,7 @@ def pdf_parse_union(
         if debug_mode:
             time_now = time.time()
             logger.info(
-                f'page_id: {page_id}, last_page_cost_time: {get_delta_time(start_time)}'
+                f"page_id: {page_id}, last_page_cost_time: {get_delta_time(start_time)}"
             )
             start_time = time_now
 
@@ -622,9 +772,9 @@ def pdf_parse_union(
             page_w = page_info.w
             page_h = page_info.h
             page_info = ocr_construct_page_component_v2(
-                [], [], page_id, page_w, page_h, [], [], [], [], [], True, 'skip page'
+                [], [], page_id, page_w, page_h, [], [], [], [], [], True, "skip page"
             )
-        pdf_info_dict[f'page_{page_id}'] = page_info
+        pdf_info_dict[f"page_{page_id}"] = page_info
 
     """分段"""
     para_split(pdf_info_dict, debug_mode=debug_mode)
@@ -632,7 +782,7 @@ def pdf_parse_union(
     """dict转list"""
     pdf_info_list = dict_to_list(pdf_info_dict)
     new_pdf_info_dict = {
-        'pdf_info': pdf_info_list,
+        "pdf_info": pdf_info_list,
     }
 
     clean_memory()
@@ -640,5 +790,5 @@ def pdf_parse_union(
     return new_pdf_info_dict
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     pass
