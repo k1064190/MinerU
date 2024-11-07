@@ -139,6 +139,7 @@ def txt_spans_extract(pdf_page, inline_equations, interline_equations, ocr_model
                 ):
                     text = __replace_STX_ETX(span["text"])
                     if is_corrupted_text(text):
+                        logger.warning(f"Corrupted text found: {text}")
                         corrupted_spans.append(
                             {
                                 "bbox": get_span_bbox_for_ocr(span),
