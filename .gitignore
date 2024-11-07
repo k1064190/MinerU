@@ -48,3 +48,9 @@ debug_utils/
 
 # sphinx docs
 _build/
+
+tests/
+build/
+magic_pdf.egg-info/
+mineru*
+projects/
